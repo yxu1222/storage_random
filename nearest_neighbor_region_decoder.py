@@ -1,16 +1,14 @@
+import sys
+sys.path.append("/u/yxu13/celltype_ibl-multiunit0/src")
+
 import torch
 import torch.nn as nn
-from celltype_ibl.models.linear_probe import classifier_probe_train_val
-from celltype_ibl.utils.ibl_data_util import (
-    get_ibl_wvf_acg_pairs,
-    get_ibl_wvf_acg_per_depth,
-)
+
 from celltype_ibl.models.BiModalEmbedding import (
     BimodalEmbeddingModel,
-    SimclrEmbeddingModel,
 )
-from celltype_ibl.utils.MLPClassifier import encode_ibl_training_data
-from celltype_ibl.utils.c4_vae_util import VAEEncoder, vae_encode_model, load_acg_vae
+
+
 from npyx.c4.dl_utils import (
     load_waveform_encoder,
 )
@@ -45,14 +43,22 @@ WVF_ENCODER_ARGS_SINGLE = {
 }  # save in a separate file to import
 
 
+model_dic = {'tempF_lnormF_dim512_simadjF_l2normT_batch1024_actgelu_data_ibl_seed42_date2024-06-17_rootF_heldoutT_init_f5bcff43': 100,
+             'tempF_lnormF_dim512_simadjF_l2normT_batch1024_actgelu_data_ibl_seed43_date2024-06-17_rootF_heldoutT_init_e636e2dc': 100,
+             'tempF_lnormF_dim512_simadjF_l2normT_batch1024_actgelu_data_ibl_seed44_date2024-06-17_rootF_heldoutT_init_c1c73f64': 100,
+             'tempF_lnormF_dim512_simadjF_l2normT_batch1024_actgelu_data_ibl_seed45_date2024-06-17_rootF_heldoutT_init_829c666c': 100,
+             'tempF_lnormF_dim512_simadjF_l2normT_batch1024_actgelu_data_ibl_seed46_date2024-06-17_rootF_heldoutT_init_739b4e86': 100}
+
+
 # MODEL_PATH = "/mnt/sdceph/users/hyu10/cell-type_representation/contrastive_experiment/tempF_dim512_augT_l2normT_batch1024_actgelu_data_ibl_seed42_date2024-04-25-18-14-39_rootF_heldoutT_init/checkpoint_epoch_1770.pt"
 MODEL_PATH = "/mnt/sdceph/users/hyu10/cell-type_representation/contrastive_experiment/tempF_dim512_augT_batch1024_actgelu_data_ibl_seed42_date2024-04-30-10-17-30_rootF_heldoutT_init/checkpoint_epoch_500.pt"
 VAE_WVF_PATH = "/mnt/sdceph/users/hyu10/cell-type_representation/ibl_vaes/wvf_singlechannel_encoder.pt"
 VAE_ACG_PATH = "/mnt/sdceph/users/hyu10/cell-type_representation/ibl_vaes/3DACG_logscale_encoder_gelu.pt"
 
-SWEEP_DIR = "/mnt/sdceph/users/hyu10/cell-type_representation/ibl_label_ratio_sweep"
+SWEEP_DIR = "/projects/bcxj/yxu13/ibl_mwvf/cell-type_representation/tune_ibl_label_ratio_sweep"
+LIN_DIR = "/projects/bcxj/yxu13/ibl_mwvf/cell-type_representation/linear_results/"
 CLIP_MODEL_DIR = (
-    "/mnt/sdceph/users/hyu10/cell-type_representation/ibl_CLIP_picked_wo_amp_jitter"
+    "/projects/bcxj/yxu13/ibl_mwvf/cell-type_representation/contrastive_experiment/"
 )
 VAE_DIR = "/mnt/sdceph/users/hyu10/cell-type_representation/ibl_vaes"
 SIMCLR_ACG_DIR = (
@@ -61,7 +67,6 @@ SIMCLR_ACG_DIR = (
 SIMCLR_WVF_DIR = (
     "/mnt/sdceph/users/hyu10/cell-type_representation/SimCLR/WVF_chosen_by_acc"
 )
-
 
 def encode_ibl_depth_test_data(
     model_path=None,
@@ -74,63 +79,78 @@ def encode_ibl_depth_test_data(
     per_depth=True,
     return_depth=False,
 ):
-    # Load the logistic regression logits
+    n_channels=25
+    if use_raw:
+        if per_depth:
+            test_wvf_rep = np.load("/projects/bcxj/yxu13/ibl_mwvf/cell-type_representation/data/testing_5nn_wvfs_{}.npy".format(n_channels))
+            test_acg_rep = np.load("/projects/bcxj/yxu13/ibl_mwvf/cell-type_representation/data/testing_5nn_acgs.npy")
+            test_cosmos_region = np.load("/projects/bcxj/yxu13/ibl_mwvf/cell-type_representation/data/testing_5nn_labels.npy")
+            return test_wvf_rep.reshape(-1,2250), test_acg_rep.reshape(-1,10,101), test_cosmos_region
+        else:
+            test_wvf_rep = np.load("/projects/bcxj/yxu13/ibl_mwvf/cell-type_representation/data/testing_wvfs_{}.npy".format(n_channels))
+            test_acg_rep = np.load("/projects/bcxj/yxu13/ibl_mwvf/cell-type_representation/data/testing_acgs.npy")
+            test_cosmos_region = np.load("/projects/bcxj/yxu13/ibl_mwvf/cell-type_representation/data/testing_labels.npy")
+            return test_wvf_rep, test_acg_rep, test_cosmos_region
+    else:
+        if per_depth:
+            test_wvf_rep = np.load("/projects/bcxj/yxu13/ibl_mwvf/cell-type_representation/data/testing_5nn_wvfs_{}.npy".format(n_channels))
+            test_acg_rep = np.load("/projects/bcxj/yxu13/ibl_mwvf/cell-type_representation/data/testing_5nn_acgs.npy")
+            test_cosmos_region = np.load("/projects/bcxj/yxu13/ibl_mwvf/cell-type_representation/data/testing_5nn_labels.npy")
+            test_wvf_rep = test_wvf_rep.reshape(-1,2250)
+            test_acg_rep = test_acg_rep.reshape(-1,10,101)
+        else:
+            test_wvf_rep = np.load("/projects/bcxj/yxu13/ibl_mwvf/cell-type_representation/data/testing_wvfs_{}.npy".format(n_channels))
+            test_acg_rep = np.load("/projects/bcxj/yxu13/ibl_mwvf/cell-type_representation/data/testing_acgs.npy")
+            test_cosmos_region = np.load("/projects/bcxj/yxu13/ibl_mwvf/cell-type_representation/data/testing_labels.npy")
+        
+        encode_model = BimodalEmbeddingModel(
+            layer_norm=False,
+            latent_dim=latent_dim,
+            l2_norm=True,
+            activation="gelu",
+            batch_norm=False,
+            in_features=90*25,
+        )        
+
+        
+        checkpoint = torch.load(model_path)
+        encode_model.load_state_dict(checkpoint["model_state_dict"])
+        encode_model.eval()
+
+        test_wvf = torch.tensor(test_wvf_rep.astype("float32"))
+        test_acg = torch.tensor(test_acg_rep.astype("float32"))
+        
+        test_wvf_rep, test_acg_rep = encode_model.representation(
+            test_wvf,
+            test_acg.reshape(-1, 1, 10, 101) * 10,
+        )
+        
+        test_wvf_rep = test_wvf_rep.detach().cpu().numpy()
+        test_acg_rep = test_acg_rep.detach().cpu().numpy()
+
+        return test_wvf_rep, test_acg_rep, test_cosmos_region
+    '''# Load the logistic regression logits
     if (embedding_model == "contrastive") | (embedding_model == "supervise"):
         encode_model = BimodalEmbeddingModel(
             layer_norm=False,
             latent_dim=latent_dim,
             l2_norm=True,
             activation="gelu",
+            batch_norm=False,
+            in_features=90*25,
         )
+            
 
         if not use_raw:
             checkpoint = torch.load(model_path)
             encode_model.load_state_dict(checkpoint["model_state_dict"])
             encode_model.eval()
-    elif embedding_model == "vae":
-        acg_vae = load_acg_vae(
-            acg_path,
-            WIN_SIZE // 2,
-            BIN_SIZE,
-            initialise=not use_raw,
-            pool="avg",
-            activation="gelu",
-        )
-        acg_head = VAEEncoder(acg_vae.encoder.to("cpu"), 10)  # maybe change this?
-
-        wvf_vae = load_waveform_encoder(
-            WVF_ENCODER_ARGS_SINGLE,
-            wvf_path,
-            in_features=90,
-            initialise=not use_raw,
-        )
-        wvf_head = VAEEncoder(wvf_vae.encoder, WVF_ENCODER_ARGS_SINGLE["d_latent"])
-
-        encode_model = vae_encode_model(wvf_head, acg_head)
-    elif embedding_model == "simclr":
-        wvf_model = SimclrEmbeddingModel(
-            latent_dim=512, layer_norm=False, modality="wvf"
-        )
-        acg_model = SimclrEmbeddingModel(
-            latent_dim=512, layer_norm=False, modality="acg"
-        )
-
-        wvf_model.load_state_dict(torch.load(wvf_path)["model_state_dict"])
-        acg_model.load_state_dict(torch.load(acg_path)["model_state_dict"])
-
-        encode_model = BimodalEmbeddingModel(
-            wvf_model.encoder, acg_model.encoder, latent_dim=512, layer_norm=False
-        )
     else:
         raise ValueError("Model not recognised")
 
     if per_depth:
         depth_wvf, depth_acg, depth_cosmos_region, depth_fold_idx, depth, pids = (
             get_ibl_wvf_acg_per_depth(return_region="Cosmos", return_depth=return_depth)
-        )
-    else:
-        depth_wvf, depth_acg, depth_cosmos_region, depth_fold_idx = (
-            get_ibl_wvf_acg_pairs(return_region="cosmos")
         )
 
     test_idx = [
@@ -172,7 +192,7 @@ def encode_ibl_depth_test_data(
         return test_wvf_rep, test_acg_rep, test_cosmos_region, depth[test_idx], pids[test_idx]
     else:
         return test_wvf_rep, test_acg_rep, test_cosmos_region
-
+'''
 
 def load_from_existing_model(
     embedding_model: str = "contrastive",
@@ -194,21 +214,24 @@ def load_from_existing_model(
             latent_dim=latent_dim,
             l2_norm=True,
             activation="gelu",
+            batch_norm=False,
+            in_features=90*25,
         )
         num = 2
         if (embedding_model == "contrastive") | (embedding_model == "simclr"):
             num = 3
-        if not freeze:
-            best_checkpoint_path = (
-                f"{SWEEP_DIR}/"
-                + f"{embedding_model}{num}_seed_{seed}/best_model_1_00.pt"
-            )
-        else:
-            best_checkpoint_path = (
-                f"{SWEEP_DIR}/"
-                + f"{embedding_model}{num}_seed_{seed}freeze/best_model_1_00.pt"
-            )
-
+        
+        globarr=glob.glob(SWEEP_DIR+"/**/*.pt")
+        for i in model_dic.keys():
+            if "seed"+str(seed) not in i:
+                continue
+            for j in globarr:
+                if not freeze:
+                    if i in j and "freeze" not in j:
+                        best_checkpoint_path = j
+                else:
+                    if i in j and "freeze" in j:
+                        best_checkpoint_path = j
     elif embedding_model == "vae":
         acg_vae = load_acg_vae(
             None,
@@ -240,10 +263,26 @@ def load_from_existing_model(
             )
     else:
         raise ValueError("Model not recognised")
-
-    clf = ibl_representation_MLP_classifier(
-        encode_model, embedding_model=embedding_model
-    )
+    if freeze:
+        clf = ibl_representation_MLP_classifier(
+            encode_model,
+            embedding_model=embedding_model,
+            n_classes=10,
+            freeze_encoder_weights=freeze,
+            modality="both",
+            layer_size=[512,512,512],
+            drop_out=0.1
+        )
+    else:
+        clf = ibl_representation_MLP_classifier(
+            encode_model,
+            embedding_model=embedding_model,
+            n_classes=10,
+            freeze_encoder_weights=freeze,
+            modality="both",
+            layer_size=[512],
+            drop_out=0.1
+        )
     best_checkpoint = torch.load(best_checkpoint_path)
     clf.load_state_dict(best_checkpoint["model_state_dict"])
 
@@ -254,8 +293,16 @@ def load_from_existing_logistic(
     embedding_model: str = "contrastive",
     seed: int = 42,
 ):
+    dic = {'tempF_lnormF_dim512_simadjF_l2normT_batch1024_actgelu_data_ibl_seed42_date2024-06-17_rootF_heldoutT_init_f5bcff43': 100,
+           'tempF_lnormF_dim512_simadjF_l2normT_batch1024_actgelu_data_ibl_seed43_date2024-06-17_rootF_heldoutT_init_e636e2dc': 100,
+           'tempF_lnormF_dim512_simadjF_l2normT_batch1024_actgelu_data_ibl_seed44_date2024-06-17_rootF_heldoutT_init_c1c73f64': 100,
+           'tempF_lnormF_dim512_simadjF_l2normT_batch1024_actgelu_data_ibl_seed45_date2024-06-17_rootF_heldoutT_init_829c666c': 100,
+           'tempF_lnormF_dim512_simadjF_l2normT_batch1024_actgelu_data_ibl_seed46_date2024-06-17_rootF_heldoutT_init_739b4e86': 100}
+    for model in dic.keys():
+        if "seed"+str(seed) in model:
+            break
     # Construct the filename based on how you saved it
-    filename = f"{SWEEP_DIR}/{embedding_model}_seed_{seed}_linear/{embedding_model}_linear_label_ratio_1_0.joblib"
+    filename = f"{LIN_DIR}/{model}/linear_probe_best_F1/model.joblib"
 
     # Load the model
     clf_loaded = load(filename)
@@ -283,7 +330,10 @@ def nearest_neighbor_logits_combine(
     else:
         use_raw = True
     if encoder == "contrastive":
-        model_path = CLIP_MODEL_DIR + f"/seed_{seed}_checkpoint.pt"
+        for modelaaaaa in model_dic.keys():
+            if "seed"+str(seed) in modelaaaaa:
+                model_path=CLIP_MODEL_DIR + f"/{modelaaaaa}/checkpoint_epoch_{model_dic[modelaaaaa]}.pt"
+                break
     elif encoder == "vae":
         acg_path = VAE_DIR + f"/3DACG_logscale_seed_{seed}_encoder_gelu.pt"
         wvf_path = VAE_DIR + f"/wvf_singlechannel_seed_{seed}_encoder.pt"
@@ -326,9 +376,8 @@ def nearest_neighbor_logits_combine(
 
     labelling = {l: i for i, l in enumerate(unique_labels)}
     test_index = [labelling[label] for label in test_cosmos_region]
-
+    
     # Get the logits for the test data
-
     if model == "mlp":
         clf = load_from_existing_model(
             embedding_model=encoder, freeze=freeze, latent_dim=latent_dim, seed=seed
@@ -338,9 +387,10 @@ def nearest_neighbor_logits_combine(
         )
         all_proba_predictions = clf.predict_proba(test_input_data)
         all_predictions = np.argmax(all_proba_predictions, axis=1)
+
     elif model == "linear":
         clf = load_from_existing_logistic(embedding_model=encoder, seed=seed)
-        test_input_data = np.concatenate([test_wvf_rep, test_acg_rep], axis=1)
+        test_input_data = np.concatenate([test_acg_rep, test_wvf_rep], axis=1)
         all_proba_predictions = clf.predict_proba(np.nan_to_num(test_input_data))
         all_predictions = np.argmax(all_proba_predictions, axis=1)
 
@@ -369,10 +419,10 @@ def nearest_neighbor_logits_combine(
     non_nan_idx = np.where(~np.isnan(final_predictions))[0]
     final_predictions = final_predictions[non_nan_idx]
     final_proba_predictions = final_proba_predictions[non_nan_idx]
-    depth =  depth[non_nan_idx]
-    pids = pids[non_nan_idx]
 
     if return_depth:
+        depth =  depth[non_nan_idx]
+        pids = pids[non_nan_idx]
         return (
             final_predictions,
             final_proba_predictions,
@@ -420,11 +470,16 @@ def average_logits(prob_predictions):
 
 if __name__ == "__main__":
     save_dir = (
-        "/mnt/sdceph/users/hyu10/cell-type_representation/ibl_k_nearest_neighbors"
+        "/projects/bcxj/yxu13/ibl_mwvf/cell-type_representation/ibl_k_nearest_neighbors"
     )
+    runrunseed=42
+    torch.manual_seed(runrunseed)
+    torch.cuda.manual_seed(runrunseed)
+    np.random.seed(runrunseed)
+
     simclr_seed = [42, 26, 29, 65, 70]
 
-    for embedding_model in ["vae"]:  # ["contrastive", "vae", "supervise"]:
+    for embedding_model in ["contrastive"]:  # ["contrastive", "vae", "supervise"]:
         for i in range(5):
             if embedding_model == "vae":
                 seed = i + 1234
@@ -447,14 +502,13 @@ if __name__ == "__main__":
                         labelling,
                     ) = nearest_neighbor_logits_combine(
                         model=model,
-                        test_fold=[3, 6],
                         latent_dim=512,
                         encoder=embedding_model,
                         per_depth=True,
                         freeze=freeze,
                         seed=seed,
                     )
-
+                    
                     overall_accuracy = balanced_accuracy_score(
                         test_index, final_predictions
                     )
@@ -488,14 +542,17 @@ if __name__ == "__main__":
                         target_names=labelling.keys(),
                         output_dict=True,
                     )
-
+                    
                     numeric_metrcs = {
+                        "test_index": test_index,
                         "majority_vote_accuracy": overall_accuracy,
                         "majority_vote_f1": overall_f1,
                         "majority_vote_cm": overall_cm,
+                        "majority_vote_predictions": final_predictions,
                         "max_proba_accuracy": max_proba_accuracy,
                         "max_proba_f1": max_proba_f1,
                         "max_proba_cm": max_proba_cm,
+                        "max_proba_predictions":final_max_proba_predictions
                     }
                     save_path = f"{save_dir}/{embedding_model}_freeze{freeze}_seed_{seed}_{model}.pkl"
                     with open(save_path, "wb") as save_:
