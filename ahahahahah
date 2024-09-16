@@ -1,5 +1,5 @@
 import sys
-sys.path.append("/u/yxu13/ibl_mwvf/celltype_ibl-mwvf00/src")
+sys.path.append("/u/yxu13/ibl_mwvf/celltype_ibl-mwvf0/src")
 
 import argparse
 import numpy as np
@@ -11,7 +11,7 @@ import pickle
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import balanced_accuracy_score
+from sklearn.metrics import balanced_accuracy_score, f1_score
 from celltype_ibl.models.BiModalEmbedding import BimodalEmbeddingModel
 from celltype_ibl.models.ACG_augmentation_dataloader import (
     EmbeddingDataset,
@@ -21,9 +21,11 @@ from celltype_ibl.models.ACG_augmentation_dataloader import (
     get_c4_unlabelled_wvf_acg_pairs,
     get_c4_labeled_dataset,
 )
-from celltype_ibl.models.metrics import topk
+from celltype_ibl.models.metrics import (topk, rankme)
 import celltype_ibl.models.linear_classifier as linear_probe
 from celltype_ibl.utils.ibl_data_util import get_ibl_wvf_acg_pairs
+
+from celltype_ibl.utils.visualize_util import umap_from_embedding
 from celltype_ibl.utils.visualize_util import umap_visualization
 from celltype_ibl.utils.allen_data_util import (
     get_allen_unlabeled_dataset,
@@ -246,7 +248,7 @@ def get_linear_probe_testset(args, acg_val=None, wvf_val=None, label_val=None):
     elif args.test_data == "Ultra":
         wvf_data = np.load(f"/projects/bcxj/yxu13/Ultra_mwvf/cell-type_representation/data/testing_wvfs_{args.n_channels}.npy")
         acg_data = np.load(f"/projects/bcxj/yxu13/Ultra_mwvf/cell-type_representation/data/testing_acgs.npy")
-        labels = np.load(f"/projects/bcxj/yxu13/Ultra_mwvf/cell-type_representation/data/testing_labels.npy")
+        labels = np.load(f"/projects/bcxj/yxu13/Ultra_mwvf/cell-type_representation/data/testing_labels.npy",allow_pickle=True)
         label_idx, correspondence, labelling = get_labels_info(labels)
         loo = False
         # by_session = False
@@ -441,7 +443,13 @@ def train():
 
     # load training dataset
 
-   
+    if not (args.adjust_to_ce | args.adjust_to_ultra):
+        wvf_length = 90
+    elif args.adjust_to_ce:
+        wvf_length = 41
+    else:
+        wvf_length = 82
+
     if args.split_validate:
         if args.dataset == "ibl":
             wvf_train = np.load("/projects/bcxj/yxu13/ibl_mwvf/cell-type_representation/data/training_wvfs_{}.npy".format(args.n_channels))
@@ -494,18 +502,26 @@ def train():
         print(f"Arguments saved to {output_dir}/args.json")
 
     if args.linear_probe:
-        test_dataset, label_idx, LABELLING, CORRESPONDENCE, session_idx, loo = (
+        test_dataset, label_idx, labelling, correspondence, session_idx, loo = (
             get_linear_probe_testset(args, acg_val, wvf_val, label_val)
         )
+
+    by_session = args.by_session
+    if by_session:
+        loo = False
+    
     # prepare the training dataset
     dataset = EmbeddingDataset(
         wvf_train,
         acg_train,
+        augmentation=args.augmentation,
         wvf_augmentation=args.wvf_augmentation,
         acg_augmentation=args.acg_augmentation,
         wvf_p=args.wvf_p,
         acg_p=args.acg_p,
         acg_normalize=args.acg_normalization,
+        std=args.std,
+        wvf_length=wvf_length,
     )
 
     wvf_tensor = torch.from_numpy(wvf_train.astype("float32")).clone().to(device)
@@ -517,7 +533,7 @@ def train():
         dataset=dataset, batch_size=args.batch_size, shuffle=True
     )
     
-    in_features=args.n_channels*args.wvf_length
+    in_features=args.n_channels*wvf_length
     
     model = BimodalEmbeddingModel(
         temperature=args.temperature,
@@ -527,24 +543,23 @@ def train():
         l2_norm=args.l2_norm,
         activation=args.activation,
         batch_norm=args.batch_norm,
-        in_features=in_features
+        acg_dropout=args.acg_dropout,
+        wvf_dropout=args.wvf_dropout,
+        loss_flood = args.loss_flood,
+        use_RINCE_loss = args.use_RINCE_loss,
+        lam = args.lam,
+        q = args.rince_q,
+        in_features = in_features,
     )
-
+    print("initialize to train...")
     start_epoch = 0
+    highest_acc = 0
+    highest_F1 = 0
     loss_all = []
     contrastive_acc1 = {}
     contrastive_acc2 = {}
     # initialise the top k accuracy for validation set
-    
     best_val_top_k = {}
-    best_val_epoch_top_k = {}
-    best_val_loss = float("INF")
-    best_val_loss_epoch = -1
-
-    best_f1_score = 0
-    best_f1_score_epoch = -1
-    
-    
     contrastive_val_acc1 = {}
     contrastive_val_acc2 = {}
     for k in args.top_k:
@@ -553,8 +568,6 @@ def train():
         contrastive_val_acc1[f"t{k}"] = []
         contrastive_val_acc2[f"t{k}"] = []
         best_val_top_k[f"t{k}"] = 0
-        best_val_epoch_top_k[f"t{k}"] = 0
-    
     temperature_all = []
     N = wvf_train.shape[0]
 
@@ -593,7 +606,12 @@ def train():
                     torch.load(args.load_pt_path)[f"validation_acc2t{k}"]
                 )
 
+    model.eval()
     for epoch in range(start_epoch, start_epoch + args.num_epochs):
+        if args.split_validate:
+            val_loss = model(
+                wvf_val_tensor, acg_val_tensor.reshape(-1, 1, 10, 101) * 10
+            )
         model.train()
         tmp_losses = []
         for idx, (wvf_batch, acg_batch) in enumerate(embedding_dataloader):
@@ -606,37 +624,16 @@ def train():
             optimizer.step()
             tmp_losses.append(loss.cpu().detach().numpy() * wvf_batch.size(dim=0))
         loss_all.append(sum(tmp_losses) / N)
-        model.eval()
-        val_loss = model(wvf_val_tensor, acg_val_tensor.reshape(-1, 1, 10, 101) * 10).cpu().detach().numpy()
+
         # print(
         #     f"Epoch {epoch}, Loss: {loss_all[-1]}",
         # )  # Print the loss
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_val_loss_epoch = epoch
-            checkpoint_path = os.path.join(
-                output_dir, "best_val_loss_checkpoint.pt"
-            )
-
-            data_save = {
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "loss": np.array(loss_all),
-                "training_acc1": contrastive_acc1,
-                "training_acc2": contrastive_acc2,
-                "validation_acc1": contrastive_val_acc1,
-                "validation_acc2": contrastive_val_acc2,
-                "temperature_all": np.array(temperature_all),
-                "best_epoch": epoch,
-            }
-            torch.save(
-                data_save,
-                checkpoint_path,
-            )
-            #if args.use_wandb:
-            #    wb.log_bl_weights(checkpoint_path)
         if args.use_wandb:
-            currlog = {"Loss": loss_all[-1], "Val Loss": val_loss}
+            currlog = {
+                "Loss": loss_all[-1],
+            }
+            if args.split_validate:
+                currlog["Val_loss"] = val_loss.cpu().detach().numpy()
         scheduler.step()
 
         temperature_all.append(model.temperature.cpu().detach().numpy())
@@ -644,12 +641,22 @@ def train():
         model.eval()
         with torch.no_grad():
             wvf_embed, acg_embed = model.embed(
-                wvf_tensor, acg_tensor.reshape(-1, 1, 10, 101) * 10
+                torch.from_numpy(wvf_train.astype("float32")).to(device),
+                torch.from_numpy(acg_train.astype("float32"))
+                .to(device)
+                .reshape(-1, 1, 10, 101)
+                * 10,
             )
 
         similarity_matrix = torch.matmul(wvf_embed, acg_embed.transpose(0, 1))
         labels = torch.arange(len(similarity_matrix)).to(similarity_matrix.device)
+        rankme_loss = rankme(torch.cat((wvf_embed, acg_embed), dim=1))
+        if args.use_wandb:
+            currlog["rankme_loss"] = rankme_loss.cpu().detach().numpy()
+        
+        del wvf_embed, acg_embed
 
+        torch.cuda.empty_cache()
         # compute top k accuracy for the training set
         for k in args.top_k:
             topk1 = topk(similarity_matrix, labels, k=k)
@@ -671,6 +678,9 @@ def train():
             labels_val = torch.arange(len(similarity_matrix_val)).to(
                 similarity_matrix_val.device
             )
+            rankme_loss_val = rankme(torch.cat((wvf_embed_val, acg_embed_val), dim=1))
+            if args.use_wandb:
+                currlog["rankme_loss_val"] = rankme_loss_val.cpu().detach().numpy()
 
             # calculate top k accuracy for validation set
             for k in args.top_k:
@@ -692,7 +702,7 @@ def train():
 
                 if avg > best_val_top_k[f"t{k}"]:
                     best_val_top_k[f"t{k}"] = avg
-                    best_val_epoch_top_k[f"t{k}"] = epoch
+
                     checkpoint_path = os.path.join(
                         output_dir, "best_top{}_checkpoint.pt".format(k)
                     )
@@ -732,11 +742,6 @@ def train():
             epoch % args.log_every_n_steps == 0
             or epoch == start_epoch + args.num_epochs - 1
         ):
-            #print("----",end="")
-            #print(epoch,end="")
-            #print("----")
-            #print(model.wvf_encoder.covn.weight)
-
             checkpoint_path = os.path.join(output_dir, f"checkpoint_epoch_{epoch}.pt")
             data_save = {
                 "model_state_dict": model.state_dict(),
@@ -757,7 +762,13 @@ def train():
             if args.linear_probe:
                 if (args.test_data == "ibl") | (
                     args.test_data == "cell_explorer_cv"
-                ):
+                ):  #################
+                    wvf_tensor = torch.from_numpy(wvf_train.astype("float32")).to(
+                        device
+                    )
+                    acg_tensor = torch.from_numpy(acg_train.astype("float32")).to(
+                        device
+                    )
                     training_data, testing_data = ibl_train_val_rep(
                         model,
                         wvf_tensor,
@@ -765,14 +776,14 @@ def train():
                         wvf_val_tensor,
                         acg_val_tensor,
                     )
-    
+                    torch.cuda.empty_cache()
                     cv_path, img_path = linear_probe_train_val(
                         os.path.join(output_dir, "linear_probe_epoch_{}".format(epoch)),
                         training_data,
                         testing_data,
                         label_train,
                         label_val,
-                        LABELLING,
+                        labelling,
                     )
                 else:
                     cv_path, img_path, _ = linear_probe.main(
@@ -794,38 +805,74 @@ def train():
                         batch_norm=args.batch_norm,
                         seed=args.seed,
                         undersample=args.undersample,
-                        use_smote=args.use_smote
+                        use_smote=args.use_smote,
+                        in_features=in_features,
                     )
-                
                 im = plt.imread(img_path)
                 if args.use_wandb:
+                    # if not args.sweep:
                     #wb.log_results(cv_path, epoch)
                     currlog["confusion_matrix"] = [wandb.Image(im)]
 
                 with open(cv_path, "rb") as f:
                     data = pickle.load(f)
-                    f1_score = data["f1_scores"]
+                    # f1_score = np.array(data["f1_scores"])
                     true_classes = data["true_targets"]
                     pred_classes = data["predicted_classes"]
                 acc = balanced_accuracy_score(true_classes, pred_classes)
-                if len(f1_score) >= 1:
-                    f1_score = np.mean(f1_score)
+                f1 = f1_score(true_classes, pred_classes, average="macro")
+                # if len(f1_score) > 1:
+                #     f1_score = np.mean(f1_score)
                 if args.use_wandb:
-                    currlog["f1_score"] = f1_score
+                    # currlog["f1_score"] = f1_score.squeeze()
+                    currlog["f1_score"] = f1
                     currlog["balanced_accuracy"] = acc
-                if f1_score>best_f1_score:
-                    best_f1_score_epoch = epoch
-                    best_f1_score = f1_score
+                    if acc > highest_acc:
+                        highest_acc = acc
+                        currlog["highest_acc"] = acc
+                    if f1 > highest_F1:
+                        # highest_F1 = f1_score
+                        # currlog["highest_F1"] = f1_score
+                        highest_F1 = f1
+                        currlog["highest_F1"] = f1
+
             if args.embedding_viz:
-                fig, legend = umap_visualization(
-                    args=args,
-                    dataset=args.test_data,
-                    embedding_model_path=checkpoint_path,
-                    latent_dim=args.dim_embed,
-                    batch_norm=args.batch_norm,
-                    features="representation",
-                    acg_normalization=args.acg_normalization,
-                    in_features=in_features
+                if args.test_data == "ibl":
+                    wvf_rep_val, acg_rep_val = model.representation(
+                        wvf_val_tensor, acg_val_tensor.reshape(-1, 1, 10, 101) * 10
+                    )
+                    wvf_rep = wvf_rep_val
+                    acg_rep = acg_rep_val
+                    labels = np.array([correspondence[i] for i in label_idx])
+                    dot_size = 1
+                elif (
+                    (args.dataset == "c4")
+                    | (args.test_data == "cell_explorer")
+                    | (args.test_data == "cell_explorer_cv")
+                    | (args.test_data == "Ultra")
+                    | (args.test_data == "kenji_allen")
+                ):
+                    acg_viz = test_dataset[:, :1010].reshape(-1, 1, 10, 101)
+                    wvf_viz = test_dataset[:, 1010:]
+                    wvf_acg_input = {}
+                    wvf_acg_input["wvf"] = torch.tensor(wvf_viz).to(device)
+                    wvf_acg_input["acg"] = torch.tensor(
+                        acg_viz.reshape(-1, 1, 10, 101)
+                    ).to(device)
+                    wvf_rep, acg_rep = model.representation(
+                        wvf_acg_input["wvf"], wvf_acg_input["acg"]
+                    )
+                    labels = np.array([correspondence[i] for i in label_idx])
+                    dot_size = 3
+                else:
+                    raise ValueError("Embedding visualization not supported")
+                fig, _ = umap_from_embedding(
+                    wvf_rep.to("cpu").detach().numpy(),
+                    acg_rep.to("cpu").detach().numpy(),
+                    labels,
+                    n_class=len(np.unique(labels)),
+                    standardize=True,
+                    dot_size=dot_size,
                 )
                 umap_img_path = os.path.join(
                     output_dir, f"embedding_visualization_epoch_{epoch}.png"
@@ -838,12 +885,15 @@ def train():
         print(torch.rand(1))
         print(np.random.rand(1))
         print()
+
         if args.use_wandb:
             wb.log(currlog)
+
     if args.use_wandb:
         wandb.finish()
 
     return model
+
 
 
 if __name__ == "__main__":
